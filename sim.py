@@ -38,28 +38,71 @@ import numpy as np
 import mujoco
 
 PANDA_XML = Path(__file__).resolve().parent / "franka_emika_panda" / "panda.xml"
+DEFAULT_SCANNED_ROOT = Path(__file__).resolve().parent / "scanned_objects_mini"
+PRIMITIVE_KINDS = ("box", "sphere", "cylinder", "capsule")
 ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
 # joint1..joint7 -> gripper menghadap ke bawah di atas tengah sabuk
 ARM_HOME = np.array([0.0, -0.05, 0.0, -2.25, 0.0, 2.20, np.pi / 4])
 
 
+def parse_object_args(values):
+    """Parse daftar nama objek dari string dipisah koma atau list CLI args."""
+    if not values:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for item in values:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out or None
+
+
+def parse_batch_size(value):
+    """Parse --batch-size seperti '1' -> (1, 1) atau '3,6' -> (3, 6)."""
+    if isinstance(value, (tuple, list)):
+        if len(value) == 1:
+            n = int(value[0])
+            return (n, n)
+        return (int(value[0]), int(value[1]))
+    parts = [int(p.strip()) for p in str(value).split(",") if p.strip()]
+    if len(parts) == 1:
+        return (parts[0], parts[0])
+    if len(parts) == 2 and 1 <= parts[0] <= parts[1]:
+        return (parts[0], parts[1])
+    raise ValueError(f"Format batch_size tidak valid: {value!r} (gunakan 'N' atau 'MIN,MAX')")
+
+
+def list_scanned_objects(scanned_root=None):
+    """Daftar nama folder model yang tersedia di direktori scanned objects."""
+    root = Path(scanned_root) if scanned_root else DEFAULT_SCANNED_ROOT
+    models = root / "models"
+    if not models.is_dir():
+        return []
+    return sorted(p.name for p in models.iterdir() if p.is_dir() and (p / "model.obj").exists())
+
+
 class ConveyorEnv:
     def __init__(
         self,
-        belt_length=2.0,
+        belt_length=1.0,
         belt_width=0.5,
-        belt_speed=0.15,        # m/s
+        belt_speed=0.05,        # m/s
         belt_gain=0.2,          # seberapa kuat objek ditarik ke kecepatan sabuk per step
-        n_pool=30,              # jumlah maksimum objek yang ada sekaligus
+        n_pool=3,              # jumlah maksimum objek yang ada sekaligus
         spawn_interval=3.0,     # detik antar batch
-        batch_size=(3, 6),      # jumlah objek per batch (min, maks)
+        batch_size=(1, 3),      # jumlah objek per batch (min, maks)
         seed=0,
         scanned_root=None,      # path ke clone mujoco_scanned_objects -> pakai objek scan, bukan primitif
         scanned_names=None,     # daftar nama folder objek; None = ambil acak dari yang ada
+        objects=None,           # pilih objek spawn: primitif (box/sphere/cylinder/capsule) atau nama/substring folder scan
         n_distinct=15,          # jumlah jenis objek scan berbeda di pool
         max_extent=0.12,        # buang objek yang sisi terpanjangnya > ini (meter), agar muat di gripper
         collision="hull",       # "hull" = 1 convex hull per objek (cepat); "submeshes" = 32 bagian V-HACD (akurat)
         object_mass=0.1,        # massa tiap objek scan (kg)
+        object_scale=1.0,       # faktor skala ukuran objek (mis. 0.65 agar cangkir 10 cm muat di gripper 8 cm)
     ):
         self.belt_length = belt_length
         self.belt_width = belt_width
@@ -67,14 +110,34 @@ class ConveyorEnv:
         self.belt_gain = belt_gain
         self.n_pool = n_pool
         self.spawn_interval = spawn_interval
-        self.batch_size = batch_size
+        self.batch_size = parse_batch_size(batch_size)
         self.start_x = -belt_length / 2 + 0.15
         self.end_x = belt_length / 2          # objek dihapus saat pusatnya melewati ini
         self.arm_base_y = -belt_width / 2 - 0.2   # lengan di sisi sabuk, x = 0 (tengah)
         self.rng = np.random.default_rng(seed)
         self.collision = collision
         self.object_mass = object_mass
-        self.scanned = self._find_scanned(scanned_root, scanned_names, n_distinct, max_extent) if scanned_root else None
+        self.object_scale = float(object_scale)
+        self.primitive_kinds = list(PRIMITIVE_KINDS)
+
+        selected = parse_object_args(objects) or parse_object_args(scanned_names)
+        if scanned_root is not None:
+            self.scanned = self._find_scanned(scanned_root, selected, n_distinct, max_extent)
+        elif selected is not None:
+            lowered = [s.lower() for s in selected]
+            if all(s in PRIMITIVE_KINDS for s in lowered):
+                self.primitive_kinds = lowered
+                self.scanned = None
+            else:
+                if (DEFAULT_SCANNED_ROOT / "models").is_dir():
+                    self.scanned = self._find_scanned(DEFAULT_SCANNED_ROOT, selected, n_distinct, max_extent)
+                else:
+                    raise ValueError(
+                        f"Objek tidak dikenal: {selected}. Primitif valid: {list(PRIMITIVE_KINDS)}, "
+                        f"atau berikan --scanned_root / --scanned."
+                    )
+        else:
+            self.scanned = None
 
         self.model = self._build_model()
         self.data = mujoco.MjData(self.model)
@@ -112,19 +175,40 @@ class ConveyorEnv:
     def _find_scanned(self, root, names, n_distinct, max_extent):
         """Pilih folder objek dari mujoco_scanned_objects yang cukup kecil untuk gripper."""
         models = Path(root) / "models"
-        if names is None:
-            names = sorted(p.name for p in models.iterdir() if p.is_dir())
-            names = [names[k] for k in self.rng.permutation(len(names))]
+        available = sorted(p.name for p in models.iterdir() if p.is_dir() and (p / "model.obj").exists())
+        explicit = names is not None
+        if not explicit:
+            names = [available[k] for k in self.rng.permutation(len(available))]
+        else:
+            resolved = []
+            for query in names:
+                if query in available:
+                    matches = [query]
+                else:
+                    q_low = query.lower()
+                    matches = [a for a in available if q_low in a.lower()]
+                if not matches:
+                    raise ValueError(
+                        f"Objek {query!r} tidak ditemukan di {models}. "
+                        f"Tersedia: {available} (primitif: {list(PRIMITIVE_KINDS)})"
+                    )
+                for m in matches:
+                    if m not in resolved:
+                        resolved.append(m)
+            names = resolved
+
         found = []
         for n in names:
             obj = models / n / "model.obj"
             if not obj.exists():
                 continue
-            verts = np.array([[float(x) for x in ln.split()[1:4]]
-                              for ln in obj.read_text().splitlines() if ln.startswith("v ")])
-            if np.ptp(verts, axis=0).max() <= max_extent:
-                found.append(models / n)
-            if len(found) >= n_distinct:
+            if not explicit:
+                verts = np.array([[float(x) for x in ln.split()[1:4]]
+                                  for ln in obj.read_text().splitlines() if ln.startswith("v ")])
+                if np.ptp(verts, axis=0).max() * self.object_scale > max_extent:
+                    continue
+            found.append(models / n)
+            if not explicit and len(found) >= n_distinct:
                 break
         if not found:
             raise ValueError(f"Tidak ada objek <= {max_extent} m di {models}")
@@ -152,17 +236,22 @@ class ConveyorEnv:
     def _build_xml(self):
         L, W = self.belt_length, self.belt_width
         objs, assets, ncoll = [], [], {}
+        scale_attr = (
+            f' scale="{self.object_scale:.6f} {self.object_scale:.6f} {self.object_scale:.6f}"'
+            if self.object_scale != 1.0
+            else ""
+        )
         if self.scanned:
             for j, d in enumerate(self.scanned):
                 p = d.as_posix()
                 assets.append(f'<texture type="2d" name="o{j}_tex" file="{p}/texture.png"/>'
                               f'<material name="o{j}_mat" texture="o{j}_tex" specular="0.5" shininess="0.5"/>'
-                              f'<mesh name="o{j}_vis" file="{p}/model.obj"/>')
+                              f'<mesh name="o{j}_vis" file="{p}/model.obj"{scale_attr}/>')
                 if self.collision == "submeshes":
                     files = sorted(d.glob("model_collision_*.obj"))
                     ncoll[j] = len(files)
                     for k, f in enumerate(files):
-                        assets.append(f'<mesh name="o{j}_c{k}" file="{f.as_posix()}"/>')
+                        assets.append(f'<mesh name="o{j}_c{k}" file="{f.as_posix()}"{scale_attr}/>')
         for i in range(self.n_pool):
             if self.scanned:
                 j = i % len(self.scanned)
@@ -174,8 +263,8 @@ class ConveyorEnv:
                     f'friction="0.8 0.01 0.001"/>' for c in cols)
                 objs.append(f'<body name="obj{i}" pos="0 3 -1"><freejoint name="obj{i}_j"/>{geoms}</body>')
                 continue
-            s = self.rng.uniform(0.02, 0.035)
-            kind = ["box", "sphere", "cylinder", "capsule"][i % 4]
+            s = self.rng.uniform(0.02, 0.035) * self.object_scale
+            kind = self.primitive_kinds[i % len(self.primitive_kinds)]
             if kind == "box":
                 size = " ".join(f"{v:.4f}" for v in s * self.rng.uniform(0.7, 1.3, 3))
             elif kind == "sphere":
@@ -388,8 +477,17 @@ def main():
     ap.add_argument("--speed", type=float, default=0.25, help="kecepatan sabuk (m/s)")
     ap.add_argument("--interval", type=float, default=3.0, help="detik antar batch spawn")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--scanned", default=None, help="path ke clone mujoco_scanned_objects")
-    ap.add_argument("--names", default=None, help="nama folder objek, dipisah koma (default: acak)")
+    ap.add_argument("--scanned", "--scanned-root", "--scanned_root", dest="scanned", default=None,
+                    help="path ke clone mujoco_scanned_objects")
+    ap.add_argument("--object", "--objects", dest="objects", nargs="+", default=None,
+                    help="pilih objek untuk di-spawn: primitif (box, sphere, cylinder, capsule) atau nama/substring model scan")
+    ap.add_argument("--names", default=None, help="alias lama untuk --object (dipisah koma)")
+    ap.add_argument("--list-objects", "--list_objects", dest="list_objects", action="store_true",
+                    help="cetak daftar objek primitif dan model scan yang tersedia lalu keluar")
+    ap.add_argument("--batch-size", "--batch_size", dest="batch_size", default="3,6",
+                    help="jumlah objek per batch: 'N' atau 'MIN,MAX' (default: 3,6)")
+    ap.add_argument("--object-scale", "--object_scale", dest="object_scale", type=float, default=1.0,
+                    help="faktor skala ukuran objek (default: 1.0)")
     ap.add_argument("--collision", choices=["hull", "submeshes"], default="hull")
     ap.add_argument("--max-extent", type=float, default=0.12, help="ukuran maks objek scan (m)")
     ap.add_argument("--wrist-cam", action="store_true", help="mulai viewer dari sudut pandang wrist_cam")
@@ -400,13 +498,25 @@ def main():
     ap.add_argument("--stream-size", default="320x240", help="resolusi streaming WxH")
     args = ap.parse_args()
 
+    if args.list_objects:
+        print("Primitives:", ", ".join(PRIMITIVE_KINDS))
+        scanned = list_scanned_objects(args.scanned)
+        src = args.scanned or str(DEFAULT_SCANNED_ROOT)
+        print(f"Scanned ({src}):")
+        for name in scanned:
+            print(f"  - {name}")
+        return
+
     w_str, h_str = args.stream_size.lower().split("x", 1)
     stream_w, stream_h = int(w_str), int(h_str)
 
     env = ConveyorEnv(belt_speed=args.speed, spawn_interval=args.interval, seed=args.seed,
+                      batch_size=args.batch_size,
                       scanned_root=args.scanned,
-                      scanned_names=args.names.split(",") if args.names else None,
-                      collision=args.collision, max_extent=args.max_extent)
+                      scanned_names=args.names,
+                      objects=args.objects,
+                      collision=args.collision, max_extent=args.max_extent,
+                      object_scale=args.object_scale)
     env.reset()
 
     publisher = (
